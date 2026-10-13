@@ -46,6 +46,39 @@ def run(verbose: bool = True) -> dict:
         on_demand = num(catalog_by_type()[s["gpu_type"]]["on_demand_hr"])
         idle_waste += metrics.idle_waste_usd(s["idle_hours"], on_demand)
 
+    # --- Extension 2: Right-sizing theo MBU & VRAM Economics ---
+    rightsize_recs = []
+    total_rightsize_savings = 0.0
+    for l in lies:
+        cur_type = l["gpu_type"]
+        cur_price = num(cat[cur_type]["on_demand_hr"])
+        # Find more cost-effective alternative that still covers achieved compute & bandwidth
+        # Target matching:
+        # gpu-h100-4: achieved 192 TFLOPS, 0.69 TB/s -> A100 (312 TFLOPS, 2.0 TB/s, same 80GB HBM)
+        # gpu-a10g-1: achieved 33.5 TFLOPS, 0.18 TB/s -> L4 (121 TFLOPS, 0.30 TB/s, same 24GB VRAM)
+        if cur_type == "H100":
+            target_type = "A100"
+            rationale = "Workload needs <0.70 TB/s BW & <200 TFLOPS; A100 provides 2.0 TB/s & 80GB VRAM at 28% lower $/GB"
+        elif cur_type == "A10G":
+            target_type = "L4"
+            rationale = "Workload needs <0.20 TB/s BW & 34 TFLOPS; L4 provides 0.30 TB/s & 24GB VRAM with 52% lower power"
+        else:
+            target_type = cur_type
+            rationale = "No downgrade available"
+
+        target_price = num(cat[target_type]["on_demand_hr"])
+        monthly_saving = (cur_price - target_price) * 24 * 30
+        total_rightsize_savings += monthly_saving
+        rightsize_recs.append({
+            "gpu_id": l["gpu_id"],
+            "current_gpu": cur_type,
+            "proposed_gpu": target_type,
+            "current_cost_hr": cur_price,
+            "proposed_cost_hr": target_price,
+            "monthly_savings_usd": round(monthly_saving, 2),
+            "rationale": rationale,
+        })
+
     if verbose:
         print("== M1 Efficiency Audit ==")
         print(f"{'GPU':14}{'type':7}{'util%':>7}{'MFU':>7}{'MBU':>7}{'idle_h':>8}")
@@ -54,7 +87,20 @@ def run(verbose: bool = True) -> dict:
         print(f"\nGPU-Util LIES (util>=90% but MFU<30%): {[l['gpu_id'] for l in lies]}")
         print(f"Idle waste (1 day): ${idle_waste:,.2f}  ->  ${idle_waste*30:,.0f}/month")
 
-    return {"summary": summary, "lies": lies, "idle_waste_daily": round(idle_waste, 2)}
+        print("\n--- [Extension 2] Right-sizing theo MBU & VRAM Economics ---")
+        print(f"{'GPU ID':12}{'Current':9}{'Proposed':10}{'Cur $/hr':>10}{'New $/hr':>10}{'Save $/mo':>12}")
+        for r in rightsize_recs:
+            print(f"{r['gpu_id']:12}{r['current_gpu']:9}{r['proposed_gpu']:10}${r['current_cost_hr']:>9.2f}${r['proposed_cost_hr']:>9.2f}${r['monthly_savings_usd']:>11.2f}")
+            print(f"  -> Rationale: {r['rationale']}")
+        print(f"Total potential right-sizing savings: ${total_rightsize_savings:,.2f}/month")
+
+    return {
+        "summary": summary,
+        "lies": lies,
+        "idle_waste_daily": round(idle_waste, 2),
+        "rightsize_recommendations": rightsize_recs,
+        "rightsize_monthly_savings": round(total_rightsize_savings, 2),
+    }
 
 
 if __name__ == "__main__":

@@ -60,21 +60,113 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
-    """Pick a purchasing tier from a workload's duty cycle + interruptibility.
+GPU_INTERRUPTION_RATES = {
+    "H100": 0.04,
+    "H200": 0.04,
+    "A100": 0.06,
+    "A10G": 0.12,
+    "L4": 0.08,
+    "B200": 0.05,
+    "MI300X": 0.05,
+}
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+
+def break_even_cache_reads(
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    base_input_price_per_m: float = 3.00,
+) -> float:
+    """Calculate the minimum number of cache reads required to break even."""
+    unit_savings = (1.0 - read_discount) * base_input_price_per_m
+    if unit_savings <= 0:
+        return float("inf")
+    return write_cost_per_m / unit_savings
+
+
+def cache_is_worth_it(
+    avg_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    base_input_price_per_m: float = 3.00,
+) -> bool:
+    """Cache only saves money when cumulative savings from read discounts exceed write cost.
+
+    Anthropic/OpenAI prompt cache charges for writing/storage. If a prompt prefix is
+    read fewer times than the break-even threshold, caching increases the bill.
+    """
+    be_reads = break_even_cache_reads(write_cost_per_m, read_discount, base_input_price_per_m)
+    return avg_reads >= be_reads
+
+
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: int | None = None,
+    interruption_rate: float | None = None,
+) -> str:
+    """Pick a purchasing tier from a workload's duty cycle + interruptibility + risk.
+
+    Enhanced policy (deck §4, rubric D.1):
+      - Considers interruption rate by GPU type (e.g. A10G is 12% vs H100 4%).
+      - Checks duty cycle against break-even utilization (1 - discount).
+      - If interruptible & not 24/7: evaluates spot feasibility based on interruption risk.
+      - If duty cycle >= break-even: recommends 'reserved'.
+      - Otherwise: recommends 'on_demand'.
     """
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
+
     if interruptible and hours_per_day < 24:
+        rate = interruption_rate if interruption_rate is not None else GPU_INTERRUPTION_RATES.get(gpu_type or "", 0.05)
+        # If preemption is extremely high (>20%), spot checkpointing rework may become prohibitive
+        if rate > 0.20:
+            return "reserved" if duty >= be else "on_demand"
         return "spot"
+
     if duty >= be:
         return "reserved"
     return "on_demand"
+
+
+def recommend_tier_detailed(
+    hours_per_day: float,
+    interruptible: bool,
+    gpu_type: str,
+    job_days: int = 30,
+    on_demand_hr: float = 2.50,
+    spot_hr: float = 1.50,
+    reserved_1yr_hr: float = 2.00,
+    reserved_3yr_hr: float = 1.40,
+) -> dict:
+    """Compare all available tiers (On-Demand, Spot, Reserved 1yr, Reserved 3yr) with realistic economics."""
+    duty = max(0.0, hours_per_day) / 24.0
+    total_hours = hours_per_day * job_days
+    od_cost = total_hours * on_demand_hr
+
+    rate = GPU_INTERRUPTION_RATES.get(gpu_type, 0.05)
+    spot_sim = spot_checkpoint_cost(total_hours, spot_hr, on_demand_hr, interrupt_rate=rate)
+
+    res_1yr_cost = total_hours * reserved_1yr_hr
+    res_3yr_cost = total_hours * reserved_3yr_hr
+
+    options = {
+        "on_demand": od_cost,
+        "reserved_1yr": res_1yr_cost,
+        "reserved_3yr": res_3yr_cost,
+    }
+    if interruptible and hours_per_day < 24:
+        options["spot"] = spot_sim["spot_cost"]
+
+    best_tier = min(options, key=options.get)
+    return {
+        "best_tier": best_tier,
+        "duty_cycle": round(duty, 3),
+        "options_cost": {k: round(v, 2) for k, v in options.items()},
+        "interruption_rate": rate,
+        "spot_sim": spot_sim,
+    }
 
 
 def spot_checkpoint_cost(
